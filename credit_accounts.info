@@ -1,0 +1,17 @@
+name = Credit Accounts
+description = Provides a new payment method and related structure for credit accounts.
+core = 7.x
+package = Custom Modules
+version = 7.x-1.0
+dependencies[] = commerce
+dependencies[] = commerce_payment
+dependencies[] = features
+dependencies[] = rules
+dependencies[] = views
+dependencies[] = chosen
+dependencies[] = group
+features[commerce_payment_method][] = credit_accounts
+features[ctools][] = views:views_default:3.0
+features[features_api][] = api:2
+features[rules_config][] = commerce_payment_credit_accounts
+features[views_view][] = credit_account_transactions

@@ -1,0 +1,355 @@
+<?php
+/**
+ * @file
+ * Provides a new payment method and related structure for credit accounts.
+ */
+
+include_once 'credit_accounts.features.inc';
+
+/**
+ * Implements hook_entity_info_alter().
+ */
+function credit_accounts_entity_info_alter(&$info) {
+  $info['commerce_payment_transaction']['fieldable'] = TRUE;
+}
+
+/*
+ * Implementation of hook_permission().
+ */
+function credit_accounts_permission() {
+  return array(
+    'access all credit accounts' => array(
+      'title' => t('Access all credit accounts'),
+      'description' => t('Access all active credit accounts.'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function credit_accounts_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $payment_methods['credit_accounts'] = array(
+    'base' => 'credit_accounts',
+    'title' => t('Credit account'),
+    'display_title' => t('Pay with a credit account'),
+    'description' => t('Pay with a credit account'),
+    'active' => TRUE,
+    'fieldable' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: submit form.
+ */
+function credit_accounts_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form = array();
+  $accounts = array();
+
+  // Gather account categories.
+  $categories = array();
+  $vocabulary = taxonomy_vocabulary_machine_name_load('credit_account_category');
+  $category_terms = entity_load('taxonomy_term', FALSE, array('vid' => $vocabulary->vid));
+  foreach ($category_terms as $category_term) {
+    $categories[$category_term->tid] = $category_term->name;
+  }
+
+  if (user_access('access all credit accounts')) {
+    // Get all active credit accounts.
+    $query = new EntityFieldQuery();
+    $query->entityCondition('entity_type', 'group')
+      ->entityCondition('bundle', 'credit_account');
+    $results = $query->execute();
+    if (isset($results['group'])) {
+      foreach ($results['group'] as $group) {
+        $group_wrapper = entity_metadata_wrapper('group', $group->gid);
+        $active = $group_wrapper->field_credit_account_active->value();
+        if ($active) {
+          $accounts[$group_wrapper->getIdentifier()] = $group_wrapper->title->value();
+        }
+      }
+    }
+
+    // Populate a default entry if there are no accounts.
+    if (empty($accounts)) {
+      $accounts[0] = t('No accounts available');
+    }
+  }
+  else {
+    $accounts = credit_accounts_get_user_credit_accounts();
+  }
+
+  asort($accounts);
+
+  $form['credit_account'] = array(
+    '#type' => 'item',
+    '#title' => t('Credit account options'),
+    '#description' => '',
+  );
+
+  $form['credit_account']['single'] = array(
+    '#type' => 'radio',
+    '#title' => t('Pay with a single account'),
+    '#default_value' => 1,
+    '#return_value' => 1,
+    '#parents' => array('credit_account'),
+    '#prefix' => '',
+  );
+
+  $form['credit_account']['single_account'] = array(
+    '#type' => 'select',
+    '#title' => t('Account'),
+    '#options' => $accounts,
+    '#chosen' => TRUE,
+    '#states' => array(
+      'visible' => array(
+        ':input[name=credit_account]' => array('value' => 1),
+      ),
+    ),
+  );
+
+  $form['credit_account']['single_category'] = array(
+    '#type' => 'select',
+    '#title' => t('Category'),
+    '#options' => $categories,
+    '#chosen' => TRUE,
+    '#states' => array(
+      'visible' => array(
+        ':input[name=credit_account]' => array('value' => 1),
+      ),
+    ),
+  );
+
+  $form['credit_account']['multiple'] = array(
+    '#type' => 'radio',
+    '#title' => t('Pay with multiple accounts.'),
+    '#return_value' => 2,
+    '#default_value' => 1,
+    '#parents' => array('credit_account'),
+  );
+
+  // Loop through line items and create an account selection per line item.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    if (isset($line_item_wrapper->commerce_product)) {
+      $title = $line_item_wrapper->commerce_product->title->value();
+      if (isset($line_item_wrapper->line_item_id)) {
+        $line_item_id = $line_item_wrapper->line_item_id->value();
+        $quantity = intval($line_item_wrapper->quantity->value());
+        $price = commerce_currency_format($line_item_wrapper->commerce_total->amount->value(), commerce_default_currency());
+
+        $form['credit_account'][$line_item_id] = array(
+          '#type' => 'fieldset',
+          '#title' => t('@title x@quantity @price', array('@title' => $title, '@quantity' => $quantity,  '@price' => $price)),
+          '#collapsible' => FALSE,
+          '#collapsed' => FALSE,
+          '#states' => array(
+            'visible' => array(
+              ':input[name=credit_account]' => array('value' => 2),
+            ),
+          ),
+        );
+
+        $form['credit_account'][$line_item_id]['account'] = array(
+          '#type' => 'select',
+          '#title' => t('Account'),
+          '#options' => $accounts,
+          '#chosen' => TRUE,
+          '#states' => array(
+            'visible' => array(
+              ':input[name=credit_account]' => array('value' => 2),
+            ),
+          ),
+        );
+
+        $form['credit_account'][$line_item_id]['category'] = array(
+          '#type' => 'select',
+          '#title' => t('Category'),
+          '#options' => $categories,
+          '#chosen' => TRUE,
+          '#states' => array(
+            'visible' => array(
+              ':input[name=credit_account]' => array('value' => 2),
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  return $form;
+}
+
+/**
+ * Payment method callback: submit form validation.
+ */
+function credit_accounts_submit_form_validate($payment_method, $pane_form, $pane_values, $order, $form_parents = array()) {
+  $passed = TRUE;
+  // Building form element name prefixes.
+  $settings = array(
+    'form_parents' => array_merge($form_parents, array('credit_account')),
+  );
+  $prefix = implode('][', $settings['form_parents']) . '][';
+
+  if ($pane_form['credit_account']['single']['#value'] == 1) {
+    // Check that an account is selected for single account option.
+    if ($pane_values['credit_account']['single_account'] == 0) {
+      form_set_error($prefix . 'single_account', t('There are no available accounts to choose from.'));
+      $passed = FALSE;
+    }
+  }
+
+  if ($pane_form['credit_account']['multiple']['#value'] == 2) {
+    // Remove the single account pane values since they aren't used with this option.
+    unset($pane_values['credit_account']['single_account']);
+    unset($pane_values['credit_account']['single_category']);
+    // Check that accounts are selected for multiple account option.
+    foreach ($pane_values['credit_account'] as $key => $values) {
+      if ($values['account'] == 0) {
+        form_set_error($prefix . $key . '][account', t('There are no available accounts to choose from.'));
+        $passed = FALSE;
+      }
+    }
+  }
+
+  return $passed;
+}
+
+/**
+ * Payment method callback: submit form submission.
+ */
+function credit_accounts_submit_form_submit($payment_method, $pane_form, $pane_values, $order, $charge) {
+  $storage = array();
+  $line_item_charges = array();
+  $message_info = array();
+
+  // Splitting each line item out into their own charges for multiple categories.
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+  foreach ($order_wrapper->commerce_line_items as $delta => $line_item_wrapper) {
+    if (isset($line_item_wrapper->line_item_id)) {
+      if (isset($line_item_wrapper->commerce_unit_price)) {
+        $message_info[$line_item_wrapper->line_item_id->value()]['charges'] = $line_item_wrapper->commerce_unit_price->value();
+      }
+      // Some extra info to record in the transaction message.
+      if (isset($line_item_wrapper->commerce_product)) {
+        $message_info[$line_item_wrapper->line_item_id->value()]['title'] = $line_item_wrapper->commerce_product->title->value();
+      }
+      if (isset($line_item_wrapper->quantity)) {
+        $message_info[$line_item_wrapper->line_item_id->value()]['quantity'] = intval($line_item_wrapper->quantity->value());
+      }
+    }
+  }
+
+  // Store pane values into order data.
+  if ($pane_form['credit_account']['single']['#value'] == 1) {
+    $storage['account'] = $pane_values['credit_account']['single_account'];
+    $storage['category'] = $pane_values['credit_account']['single_category'];
+    $storage['message'] = '';
+
+    // Build transaction message.
+    foreach ($message_info as $info) {
+      $price = commerce_currency_format($info['charges']['amount'], $info['charges']['currency_code']);
+      $storage['message'] .= t('<p>@title x@quantity @price</p>', array('@title' => $info['title'], '@quantity' => $info['quantity'],  '@price' => $price));
+    }
+
+    // Send essential data and process a single transaction.
+    $order->data['credit_accounts'] = $storage;
+    credit_accounts_transaction($payment_method, $order, $charge);
+  }
+
+  // Multiple option was chosen, remove single account data.
+  if ($pane_form['credit_account']['multiple']['#value'] == 2) {
+    unset($pane_values['credit_account']['single_account']);
+    unset($pane_values['credit_account']['single_category']);
+    foreach ($pane_values['credit_account'] as $line_item_id => $values) {
+      $price = commerce_currency_format($message_info[$line_item_id]['charges']['amount'], $message_info[$line_item_id]['charges']['currency_code']);
+      $values['message'] = t('<p>@title x@quantity @price</p>', array('@title' => $message_info[$line_item_id]['title'], '@quantity' => $message_info[$line_item_id]['quantity'],  '@price' => $price));
+      $order->data['credit_accounts'] = $values;
+      credit_accounts_transaction($payment_method, $order, $message_info[$line_item_id]['charges']);
+    }
+  }
+}
+
+/**
+ * Creates a credit account payment transaction for the given charge amount.
+ *
+ * @param $payment_method
+ *   The payment method instance object used to charge this payment.
+ * @param $order
+ *   The order object the payment applies to.
+ * @param $charge
+ *   An array indicating the amount and currency code to charge.
+ */
+function credit_accounts_transaction($payment_method, $order, $charge) {
+  $details = $order->data['credit_accounts'];
+
+  $transaction = commerce_payment_transaction_new('credit_accounts', $order->order_id);
+  $transaction->instance_id = $payment_method['instance_id'];
+  $transaction->amount = $charge['amount'];
+  $transaction->currency_code = $charge['currency_code'];
+  $transaction->field_account_category[LANGUAGE_NONE][0]['tid'] = $details['category'];
+  $transaction->field_account_name[LANGUAGE_NONE][0]['target_id'] = $details['account'];
+  $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+  $transaction->message = $details['message'];
+
+  commerce_payment_transaction_save($transaction);
+  return $transaction;
+}
+
+/*
+ * Gathers a list of credit accounts the user can administrate.
+ *
+ * @return array
+ *  Returns an array of credit account group titles keyed by their group id.
+ */
+function credit_accounts_get_user_credit_accounts() {
+  global $user;
+  $accounts = array();
+
+  // Retrieve all active memberships.
+  if ($memberships = GroupMembership::getByActiveStatus($user->uid)) {
+
+    foreach ($memberships as $group_membership) {
+      $membership_wrapper = entity_metadata_wrapper('group_membership', $group_membership);
+
+      // Extract the membership roles.
+      foreach ($membership_wrapper->roles->getIterator() as $group_role_wrapper) {
+        $role = $group_role_wrapper->name->value();
+        // Only check those groups that the user is admin of.
+        if ($role == 'group_admin') {
+          // Check for credit account subgroups.
+          $credit_account_groups = $membership_wrapper->group->value()->getEntitiesofType('group', 'credit_account');
+          if ($credit_account_groups) {
+            foreach ($credit_account_groups as $credit_account_group) {
+              $credit_account_group_wrapper = entity_metadata_wrapper('group', $credit_account_group);
+              $active = $credit_account_group_wrapper->field_credit_account_active->value();
+              if ($active) {
+                $accounts[$credit_account_group_wrapper->getIdentifier()] = $credit_account_group_wrapper->title->value();
+              }
+            }
+          }
+
+          // Is this a current membership of a credit account? If so, add as well.
+          $type = $membership_wrapper->group->group_type->name->value();
+          if ($type == 'credit_account') {
+            $active = $membership_wrapper->group->field_credit_account_active->value();
+            if ($active) {
+              $accounts[$membership_wrapper->group->gid->value()] = $membership_wrapper->group->title->value();
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Populate a default entry if there are no accounts.
+  if (empty($accounts)) {
+    $accounts[0] = t('No accounts available');
+  }
+
+  return $accounts;
+}
